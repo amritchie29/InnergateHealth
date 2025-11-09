@@ -1,0 +1,55 @@
+name: Deploy static site to droplet
+
+on:
+  push:
+    branches: [ "main" ]   # change if your default branch isn't main
+  workflow_dispatch: {}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine source path
+        id: path
+        run: |
+          if [ -z "${{ secrets.SUBDIR }}" ]; then
+            echo "SRC=." >> $GITHUB_OUTPUT
+          else
+            echo "SRC=${{ secrets.SUBDIR }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install rsync & ssh
+        run: sudo apt-get update && sudo apt-get install -y rsync openssh-client
+
+      - name: Add droplet to known_hosts
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Deploy via rsync
+        env:
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+        run: |
+          set -e
+          eval "$(ssh-agent -s)"
+          ssh-add <(printf "%s" "$SSH_KEY")
+
+          SRC="${{ steps.path.outputs.SRC }}/"
+          DEST="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.DEPLOY_PATH }}/"
+
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '${{ secrets.DEPLOY_PATH }}'"
+
+          rsync -az --delete -e "ssh -p ${{ secrets.SSH_PORT }}" \
+            --include="*/" \
+            --include="index.html" \
+            --include="*.html" \
+            --include="manifest.json" \
+            --include="service-worker.js" \
+            --include="assets/***" --include="img/***" --include="css/***" --include="js/***" \
+            --exclude="*" \
+            "$SRC" "$DEST"
+
+          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+            "sudo /usr/sbin/nginx -t && sudo /usr/bin/systemctl reload nginx"
