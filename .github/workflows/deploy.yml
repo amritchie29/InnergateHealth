@@ -2,16 +2,22 @@ name: Deploy static site to droplet
 
 on:
   push:
-    branches: [ "main" ]   # change if your default branch isn't main
+    branches: [ "main" ]        # change if your default branch is different
   workflow_dispatch: {}
+
+# Avoid overlapping deployments
+concurrency:
+  group: droplet-deploy
+  cancel-in-progress: true
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-      - name: Determine source path
+      - name: Determine source path (supports SUBDIR secret)
         id: path
         run: |
           if [ -z "${{ secrets.SUBDIR }}" ]; then
@@ -20,28 +26,39 @@ jobs:
             echo "SRC=${{ secrets.SUBDIR }}" >> $GITHUB_OUTPUT
           fi
 
-      - name: Install rsync & ssh
+      - name: Install rsync & ssh client
         run: sudo apt-get update && sudo apt-get install -y rsync openssh-client
+
+      - name: Prepare SSH key (normalize line endings)
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
 
       - name: Add droplet to known_hosts
         run: |
-          mkdir -p ~/.ssh
           ssh-keyscan -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
 
+      - name: Smoke test SSH
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "echo ssh ok"
+
       - name: Deploy via rsync
-        env:
-          SSH_KEY: ${{ secrets.SSH_KEY }}
         run: |
           set -e
-          eval "$(ssh-agent -s)"
-          ssh-add <(printf "%s" "$SSH_KEY")
-
           SRC="${{ steps.path.outputs.SRC }}/"
           DEST="${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.DEPLOY_PATH }}/"
 
-          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '${{ secrets.DEPLOY_PATH }}'"
+          # Ensure destination exists
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" "mkdir -p '${{ secrets.DEPLOY_PATH }}'"
 
-          rsync -az --delete -e "ssh -p ${{ secrets.SSH_PORT }}" \
+          # Sync site files (adjust includes if your layout differs)
+          rsync -azv --itemize-changes --delete \
+            -e "ssh -i ~/.ssh/id_ed25519 -p ${{ secrets.SSH_PORT }} -o StrictHostKeyChecking=yes" \
             --include="*/" \
             --include="index.html" \
             --include="*.html" \
@@ -51,5 +68,9 @@ jobs:
             --exclude="*" \
             "$SRC" "$DEST"
 
-          ssh -p "${{ secrets.SSH_PORT }}" "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+      - name: Reload Nginx
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -p "${{ secrets.SSH_PORT }}" \
+            -o StrictHostKeyChecking=yes \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
             "sudo /usr/sbin/nginx -t && sudo /usr/bin/systemctl reload nginx"
